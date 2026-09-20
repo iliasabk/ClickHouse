@@ -342,7 +342,12 @@ protected:
 /// `(SELECT * FROM t)`), so both readings parse for `WHERE (from IN ('a'))`: the expression
 /// `from IN ('a')`, and the subquery `SELECT * FROM IN('a')` over a table function named `IN`. The
 /// column reading is older than the FROM-first form, so it wins the ambiguity.
-bool parenthesesHoldExpressionOverColumnNamedFrom(IParser::Pos pos);
+///
+/// On success `contents` holds the already-parsed contents (an ASTExpressionList, as produced by
+/// ParserExpressionList) and `contents_end` points at the closing `)`, so a caller that goes on to
+/// parse the same parenthesized expression can reuse the result instead of building the same AST a
+/// second time.
+bool parenthesesHoldExpressionOverColumnNamedFrom(IParser::Pos pos, ASTPtr & contents, IParser::Pos & contents_end);
 
 }
 

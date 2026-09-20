@@ -216,6 +216,8 @@ static ASTPtr buildSelectFromTableFunction(const boost::intrusive_ptr<ASTFunctio
 bool ParserSubquery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     starts_with_valid_select_or_explain = false;
+    expression_over_from = nullptr;
+    expression_over_from_end.reset();
 
     ParserWithOptionalAlias select(std::make_unique<ParserSelectWithUnionQuery>(), false);
     ParserExplainQuery explain;
@@ -236,8 +238,17 @@ bool ParserSubquery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     const bool starts_with_from_clause
         = pos->type == TokenType::BareWord && equalsCaseInsensitive(std::string_view(pos->begin, pos->size()), "from");
 
-    if (starts_with_from_clause && parenthesesHoldExpressionOverColumnNamedFrom(opening_bracket_pos))
-        return false;
+    if (starts_with_from_clause)
+    {
+        ASTPtr contents;
+        Pos contents_end = pos;
+        if (parenthesesHoldExpressionOverColumnNamedFrom(opening_bracket_pos, contents, contents_end))
+        {
+            expression_over_from = std::move(contents);
+            expression_over_from_end = contents_end;
+            return false;
+        }
+    }
 
     ASTPtr result_node = nullptr;
 

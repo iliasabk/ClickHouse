@@ -18,12 +18,27 @@ class ParserSubquery : public IParserBase
 public:
     bool startsWithValidSelectOrExplain() const { return starts_with_valid_select_or_explain; }
 
+    /// When parseImpl rejected `(from <operator> ...)` as a subquery because the parentheses hold an
+    /// expression over a column named `from`, the disambiguation lookahead has already fully parsed
+    /// the contents. Hand them to the caller so it does not have to parse the same tokens again;
+    /// under nested parentheses that second parse compounds exponentially.
+    /// `end` is set to the position of the closing `)`.
+    ASTPtr takeExpressionOverFrom(Pos & end)
+    {
+        if (!expression_over_from)
+            return nullptr;
+        end = *expression_over_from_end;
+        return std::move(expression_over_from);
+    }
+
 protected:
     const char * getName() const override { return "SELECT or EXPLAIN subquery"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
 
 private:
     bool starts_with_valid_select_or_explain = false;
+    ASTPtr expression_over_from;
+    std::optional<Pos> expression_over_from_end;
 };
 
 

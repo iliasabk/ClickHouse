@@ -3509,7 +3509,7 @@ static bool isArrayQuantifierPredicate(std::string_view function_name)
 /// the subquery reading is the only one: `(FROM t)`, `(FROM numbers(10) |> LIMIT 1)`,
 /// `(FROM (SELECT 1))`. Even then the reading is taken only if the parentheses really do hold an
 /// expression, which keeps a relation named after an operator readable as one: `1 IN (FROM in)`.
-bool parenthesesHoldExpressionOverColumnNamedFrom(IParser::Pos pos)
+bool parenthesesHoldExpressionOverColumnNamedFrom(IParser::Pos pos, ASTPtr & contents, IParser::Pos & contents_end)
 {
     if (pos->type != TokenType::OpeningRoundBracket)
         return false;
@@ -3537,9 +3537,13 @@ bool parenthesesHoldExpressionOverColumnNamedFrom(IParser::Pos pos)
         return false;
 
     /// The contents can also be a tuple or carry an alias, so parse them the way RoundBracketsLayer does.
-    ASTPtr contents;
+    /// The AST is handed to the caller so that the contents do not have to be parsed a second time.
     ParserExpressionList contents_parser(/*allow_alias_without_as_keyword*/ false);
-    return contents_parser.parse(contents_pos, contents, expected) && contents_pos->type == TokenType::ClosingRoundBracket;
+    if (!contents_parser.parse(contents_pos, contents, expected) || contents_pos->type != TokenType::ClosingRoundBracket)
+        return false;
+
+    contents_end = contents_pos;
+    return true;
 }
 
 Action ParserExpressionImpl::tryParseOperand(Layers & layers, IParser::Pos & pos, Expected & expected)
@@ -3811,6 +3815,37 @@ Action ParserExpressionImpl::tryParseOperand(Layers & layers, IParser::Pos & pos
             /// If subquery starts with a valid "SELECT" or "EXPLAIN", but failed later. It means there is a syntax error.
             if (subquery_parser.startsWithValidSelectOrExplain())
                 return Action::NONE;
+
+            /// `(from <operator> ...)` is not a subquery but an expression over a column named
+            /// `from`. The disambiguation check inside ParserSubquery has already parsed the
+            /// contents, so reuse them here: parsing the same tokens again through
+            /// RoundBracketsLayer doubles the work at every level of nested parentheses.
+            IParser::Pos contents_end = pos;
+            if (ASTPtr contents = subquery_parser.takeExpressionOverFrom(contents_end))
+            {
+                ASTs & elements = contents->as<ASTExpressionList &>().children;
+                if (elements.empty())
+                    return Action::NONE;
+
+                pos = contents_end;
+                ++pos;
+
+                /// The same wrapping RoundBracketsLayer::getResultImpl performs: a single element
+                /// is the expression itself (marked parenthesized), several are a tuple, and a
+                /// lambda arrow after `)` wraps a single element in a tuple too (`(x) -> ...`).
+                if (elements.size() == 1 && pos->type != TokenType::Arrow)
+                {
+                    tmp = std::move(elements.front());
+                    tmp->setParenthesized(true);
+                }
+                else
+                {
+                    tmp = makeASTOperator("tuple", std::move(elements));
+                }
+
+                layers.back()->pushOperand(std::move(tmp));
+                return Action::OPERATOR;
+            }
 
             ++pos;
             layers.push_back(std::make_unique<RoundBracketsLayer>());

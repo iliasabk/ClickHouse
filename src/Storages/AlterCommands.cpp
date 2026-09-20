@@ -1787,23 +1787,31 @@ void AlterCommands::apply(StorageInMemoryMetadata & metadata, ContextPtr context
         if (!command.ignore)
             command.apply(metadata_copy, context, share_nested_offsets, &metadata.columns);
 
+    /// Persisted key, index and projection types must be the types a fresh
+    /// reload resolves: analyse them in the global context, not in the session
+    /// that happens to issue the `ALTER` (session settings such as
+    /// `cast_keep_nullable` would otherwise leak into the recorded key types,
+    /// and the next INSERT would serialize a plain column through a Nullable
+    /// serialization).
+    const ContextPtr metadata_context = context->getGlobalContext();
+
     /// Changes in columns may lead to changes in keys expression.
-    metadata_copy.sorting_key.recalculateWithNewAST(metadata_copy.sorting_key.definition_ast, metadata_copy.columns, metadata_copy.virtuals, context);
+    metadata_copy.sorting_key.recalculateWithNewAST(metadata_copy.sorting_key.definition_ast, metadata_copy.columns, metadata_copy.virtuals, metadata_context);
     if (metadata_copy.primary_key.definition_ast != nullptr)
     {
         metadata_copy.primary_key = KeyDescription::getPrimaryKeyFromAST(
-            metadata_copy.primary_key.definition_ast, metadata_copy.sorting_key, metadata_copy.columns, metadata_copy.virtuals, context);
+            metadata_copy.primary_key.definition_ast, metadata_copy.sorting_key, metadata_copy.columns, metadata_copy.virtuals, metadata_context);
     }
     else
     {
-        metadata_copy.primary_key = KeyDescription::getKeyFromAST(metadata_copy.sorting_key.definition_ast, metadata_copy.columns, metadata_copy.virtuals, context);
+        metadata_copy.primary_key = KeyDescription::getKeyFromAST(metadata_copy.sorting_key.definition_ast, metadata_copy.columns, metadata_copy.virtuals, metadata_context);
         metadata_copy.primary_key.definition_ast = nullptr;
     }
 
     /// And in partition key expression
     if (metadata_copy.partition_key.definition_ast != nullptr)
     {
-        metadata_copy.partition_key.recalculateWithNewAST(metadata_copy.partition_key.definition_ast, metadata_copy.columns, metadata_copy.virtuals, context);
+        metadata_copy.partition_key.recalculateWithNewAST(metadata_copy.partition_key.definition_ast, metadata_copy.columns, metadata_copy.virtuals, metadata_context);
 
         /// If partition key expression is changed, we also need to rebuild minmax_count_projection
         if (metadata.minmax_count_projection && !blocksHaveEqualStructure(metadata_copy.partition_key.sample_block, metadata.partition_key.sample_block))
@@ -1812,25 +1820,22 @@ void AlterCommands::apply(StorageInMemoryMetadata & metadata, ContextPtr context
             auto partition_key = metadata_copy.partition_key.expression_list_ast->clone();
             FunctionNameNormalizer::visit(partition_key.get());
             metadata_copy.minmax_count_projection.emplace(ProjectionDescription::getMinMaxCountProjection(
-                metadata_copy.columns, partition_key, minmax_columns, metadata_copy.primary_key, &metadata_copy.partition_key, context));
+                metadata_copy.columns, partition_key, minmax_columns, metadata_copy.primary_key, &metadata_copy.partition_key, metadata_context));
         }
     }
 
     // /// And in sample key expression
     if (metadata_copy.sampling_key.definition_ast != nullptr)
-        metadata_copy.sampling_key.recalculateWithNewAST(metadata_copy.sampling_key.definition_ast, metadata_copy.columns, metadata_copy.virtuals, context);
+        metadata_copy.sampling_key.recalculateWithNewAST(metadata_copy.sampling_key.definition_ast, metadata_copy.columns, metadata_copy.virtuals, metadata_context);
 
     /// Changes in columns may lead to changes in secondary indices
     const ColumnsDescription columns_with_virtuals = metadata_copy.getColumnsWithVirtuals();
-    /// The resolved index type is persisted, so it must be the type a fresh reload resolves: analyse it
-    /// in the global context, not in the session that happens to issue the `ALTER`.
-    const ContextPtr index_context = context->getGlobalContext();
     for (auto & index : metadata_copy.secondary_indices)
     {
         try
         {
             index = IndexDescription::getIndexFromAST(
-                index.definition_ast, columns_with_virtuals, index.isImplicitlyCreated(), index.escape_filenames, index_context);
+                index.definition_ast, columns_with_virtuals, index.isImplicitlyCreated(), index.escape_filenames, metadata_context);
         }
         catch (const Exception & exception)
         {
@@ -1845,7 +1850,7 @@ void AlterCommands::apply(StorageInMemoryMetadata & metadata, ContextPtr context
         try
         {
             /// Check if we can still build projection from new metadata.
-            auto new_projection = ProjectionDescription::getProjectionFromAST(projection.definition_ast, metadata_copy.columns, &metadata_copy.partition_key, context);
+            auto new_projection = ProjectionDescription::getProjectionFromAST(projection.definition_ast, metadata_copy.columns, &metadata_copy.partition_key, metadata_context);
             /// Check if new metadata has the same keys as the old one.
             if (!blocksHaveEqualStructure(projection.sample_block_for_keys, new_projection.sample_block_for_keys))
                 throw Exception(ErrorCodes::ALTER_OF_COLUMN_IS_FORBIDDEN, "Cannot ALTER column");

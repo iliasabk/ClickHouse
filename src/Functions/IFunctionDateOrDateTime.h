@@ -119,13 +119,6 @@ public:
             const IFunction::Monotonicity is_monotonic = { .is_monotonic = true };
             const IFunction::Monotonicity is_not_monotonic;
 
-            const DateLUTImpl * date_lut = &DateLUT::instance();
-            if (const auto * timezone = dynamic_cast<const TimezoneMixin *>(&type))
-                date_lut = &timezone->getTimeZone();
-
-            if (left.isNull() || right.isNull())
-                return is_not_monotonic;
-
             const auto * type_ptr = &type;
 
             if (const auto * lc_type = checkAndGetDataType<DataTypeLowCardinality>(type_ptr))
@@ -133,6 +126,17 @@ public:
 
             if (const auto * nullable_type = checkAndGetDataType<DataTypeNullable>(type_ptr))
                 type_ptr = nullable_type->getNestedType().get();
+
+            /// The function resolves its time zone from the unwrapped argument type
+            /// (`extractTimeZoneFromFunctionArguments`), so the factor comparison below has to use
+            /// that same zone: the `Nullable`/`LowCardinality` wrapper carries none and would
+            /// silently fall back to the session zone, which can invert the mapped key range.
+            const DateLUTImpl * date_lut = &DateLUT::instance();
+            if (const auto * timezone = dynamic_cast<const TimezoneMixin *>(type_ptr))
+                date_lut = &timezone->getTimeZone();
+
+            if (left.isNull() || right.isNull())
+                return is_not_monotonic;
 
             /// The function is monotonous on the [left, right] segment, if the factor transformation returns the same values for them.
 

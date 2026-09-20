@@ -10,6 +10,9 @@ namespace DB
 class IDisk;
 using DiskPtr = std::shared_ptr<IDisk>;
 
+class IBackup;
+using BackupPtr = std::shared_ptr<const IBackup>;
+
 class Set;
 using SetPtr = std::shared_ptr<Set>;
 
@@ -24,6 +27,9 @@ public:
     static VirtualColumnsDescription createVirtuals();
 
     void rename(const String & new_path_to_table_data, const StorageID & new_table_id) override;
+
+    void backupData(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
+    void restoreDataFromBackup(RestorerFromBackup & restorer, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
 
     SinkToStoragePtr write(const ASTPtr & query, const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr context, bool async_insert) override;
 
@@ -51,6 +57,7 @@ protected:
 
 private:
     void restoreFromFile(const String & file_path);
+    void restoreDataImpl(const BackupPtr & backup, const String & data_path_in_backup);
 
     /// Insert the block into the state.
     virtual void insertBlock(const Block & block, ContextPtr context) = 0;

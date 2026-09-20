@@ -19,8 +19,18 @@
 #include <Interpreters/Set.h>
 #include <Processors/Sinks/SinkToStorage.h>
 #include <Parsers/ASTCreateQuery.h>
+#include <Backups/BackupEntriesCollector.h>
+#include <Backups/BackupEntryFromAppendOnlyFile.h>
+#include <Backups/BackupEntryFromMemory.h>
+#include <Backups/BackupEntryWrappedWith.h>
+#include <Backups/IBackup.h>
+#include <Backups/RestorerFromBackup.h>
+#include <Disks/TemporaryFileOnDisk.h>
+#include <Disks/WriteMode.h>
+#include <algorithm>
 #include <filesystem>
 #include <optional>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -36,8 +46,17 @@ namespace SetSetting
 
 namespace ErrorCodes
 {
+    extern const int CANNOT_RESTORE_TABLE;
     extern const int INCORRECT_FILE_NAME;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+}
+
+namespace
+{
+/// Written to every backup of a Set or Join table, even when the table produced no data
+/// files, so that restore can tell a real (possibly empty) backup apart from a
+/// structure_only or pre-fix metadata-only one.
+const char * set_or_join_backup_marker = ".set_or_join_backup";
 }
 
 class SetOrJoinSink final : public SinkToStorage, WithContext
@@ -333,6 +352,131 @@ void StorageSetOrJoinBase::restoreFromFile(const String & file_path)
     /// TODO Add speed, compressed bytes, data volume in memory, compression ratio ... Generalize all statistics logging in project.
     LOG_INFO(getLogger("StorageSetOrJoinBase"), "Loaded from backup file {}. {} rows, {}. State has {} unique rows.",
         file_path, info.rows, ReadableSize(info.bytes), getSize(ctx));
+}
+
+
+void StorageSetOrJoinBase::backupData(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & /* partitions */)
+{
+    fs::path data_path_in_backup_fs = data_path_in_backup;
+
+    size_t num_files = 0;
+    if (persistent && disk->existsDirectory(path))
+    {
+        /// Each finished data file is immutable once SetOrJoinSink::onFinish() moves it out of
+        /// tmp/, but a concurrent TRUNCATE removes the whole data directory. Hard-link every file
+        /// into a private temporary directory first so the backup entries stay valid regardless
+        /// (the same approach StorageLog uses for its data files).
+        auto temp_dir_owner = std::make_shared<TemporaryFileOnDisk>(disk, "tmp/");
+        fs::path temp_dir = temp_dir_owner->getRelativePath();
+        disk->createDirectories(temp_dir);
+
+        const auto & backup_settings = backup_entries_collector.getBackupSettings();
+        bool copy_encrypted = !backup_settings.decrypt_files_from_encrypted_disks;
+        bool allow_checksums_from_remote_paths = backup_settings.allow_checksums_from_remote_paths;
+
+        for (auto dir_it = disk->iterateDirectory(path); dir_it->isValid(); dir_it->next())
+        {
+            const auto & file_name = dir_it->name();
+            const auto & file_path = dir_it->path();
+
+            /// The tmp/ subdirectory and still-in-flight inserts (written under tmp/ and moved
+            /// into place atomically) are not part of the durable state yet, so only the
+            /// finalized *.bin files are copied.
+            if (!disk->existsFile(file_path) || !endsWith(file_name, ".bin"))
+                continue;
+            auto file_size = disk->getFileSize(file_path);
+            if (!file_size)
+                continue;
+
+            String hardlink_file_path = temp_dir / file_name;
+            disk->createHardLink(file_path, hardlink_file_path);
+            BackupEntryPtr backup_entry = std::make_unique<BackupEntryFromAppendOnlyFile>(
+                disk, hardlink_file_path, copy_encrypted, file_size, allow_checksums_from_remote_paths);
+            backup_entry = wrapBackupEntryWith(std::move(backup_entry), temp_dir_owner);
+            backup_entries_collector.addBackupEntry(data_path_in_backup_fs / file_name, std::move(backup_entry));
+            ++num_files;
+        }
+    }
+    /// else: nothing durable exists to save. The in-memory state has no serialization, and the
+    /// table was explicitly created with persistent = false, which opts out of surviving a
+    /// restart; a backup round-trip is no stronger a guarantee than that.
+
+    /// Always write the marker, even when no data files were produced, so that restore can tell
+    /// this backup apart from a structure_only or pre-fix metadata-only backup.
+    backup_entries_collector.addBackupEntry(
+        data_path_in_backup_fs / set_or_join_backup_marker,
+        std::make_unique<BackupEntryFromMemory>(toString(num_files)));
+}
+
+void StorageSetOrJoinBase::restoreDataFromBackup(RestorerFromBackup & restorer, const String & data_path_in_backup, const std::optional<ASTs> & /* partitions */)
+{
+    auto backup = restorer.getBackup();
+
+    /// backupData() writes the marker file even for an empty table, so a data restore finding no
+    /// marker means one of: (a) the backup was made with structure_only = true and should be
+    /// restored the same way, with SETTINGS structure_only = true; (b) the backup predates
+    /// Set/Join tables backing up their data
+    /// (see https://github.com/ClickHouse/ClickHouse/issues/121176); or (c) the backup is
+    /// corrupted. Restoring it as data would silently recreate an empty table, so fail closed.
+    String marker_file = fs::path(data_path_in_backup) / set_or_join_backup_marker;
+    if (!backup->fileExists(marker_file))
+        throw Exception(
+            ErrorCodes::CANNOT_RESTORE_TABLE,
+            "Backup of table {} has no data marker {}. If this backup was created with structure_only = true, "
+            "restore it with SETTINGS structure_only = true. Otherwise it predates Set/Join tables backing up "
+            "their data (see https://github.com/ClickHouse/ClickHouse/issues/121176) or is corrupted; restoring "
+            "its data would silently produce an empty table",
+            getStorageID().getNameForLogs(), marker_file);
+
+    if (!restorer.isNonEmptyTableAllowed() && getSize(restorer.getContext()))
+        RestorerFromBackup::throwTableIsNotEmpty(getStorageID());
+
+    restorer.addDataRestoreTask(
+        [storage = std::static_pointer_cast<StorageSetOrJoinBase>(shared_from_this()), backup, data_path_in_backup]
+        { storage->restoreDataImpl(backup, data_path_in_backup); });
+}
+
+void StorageSetOrJoinBase::restoreDataImpl(const BackupPtr & backup, const String & data_path_in_backup)
+{
+    fs::path data_path_in_backup_fs = data_path_in_backup;
+
+    /// Collect the backed-up data files in the order the blocks were originally written.
+    /// The order may be important for storage Join, where the user expects to get the first
+    /// row (unless `join_any_take_last_row` is set).
+    std::vector<std::pair<UInt64, String>> data_files;
+    static const char * file_suffix = ".bin";
+    static const auto file_suffix_size = strlen(".bin");
+    for (const String & file_name : backup->listFiles(data_path_in_backup, /* recursive */ false))
+    {
+        if (!endsWith(file_name, file_suffix))
+            continue;
+        UInt64 file_num = parse<UInt64>(file_name.substr(0, file_name.size() - file_suffix_size));
+        data_files.emplace_back(file_num, file_name);
+    }
+    std::sort(data_files.begin(), data_files.end());
+
+    for (const auto & data_file : data_files)
+    {
+        String file_path_in_backup = data_path_in_backup_fs / data_file.second;
+        if (persistent)
+        {
+            /// Land the file under a fresh number so that a restore into a non-empty table
+            /// (allow_non_empty_tables) cannot collide with its existing files, then replay it.
+            String target_path = fs::path(path) / (toString(++increment) + file_suffix);
+            backup->copyFileToDisk(file_path_in_backup, disk, target_path, WriteMode::Rewrite, /* sync= */ false);
+            restoreFromFile(target_path);
+        }
+        else
+        {
+            /// A non-persistent table keeps nothing on disk; load the rows straight into memory.
+            auto read_buf = backup->readFile(file_path_in_backup);
+            CompressedReadBuffer compressed_buf(*read_buf);
+            NativeReader reader(compressed_buf, 0);
+            for (Block block = reader.read(); !block.empty(); block = reader.read())
+                insertBlock(block, nullptr);
+            finishInsert();
+        }
+    }
 }
 
 

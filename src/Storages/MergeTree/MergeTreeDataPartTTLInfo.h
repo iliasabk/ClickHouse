@@ -28,6 +28,10 @@ struct MergeTreeDataPartTTLInfo
     bool finished() const { return ttl_finished.value_or(false); }
     bool initialized() const { return min != 0 || max != 0; }
 
+    /// Whether the stored deadline is set and already reached at `current_time`
+    /// — the same test ITTLAlgorithm::isTTLExpired applies to stored TTL info.
+    bool expired(time_t current_time) const { return max != 0 && max <= current_time; }
+
     void update(time_t time);
     void update(const MergeTreeDataPartTTLInfo & other_info);
 };

@@ -1871,11 +1871,24 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
                 /// A TTLDrop merge deletes every row only when an unconditional rows TTL is the
                 /// table's only TTL. With a GROUP BY, WHERE or column TTL rows survive and the
                 /// merge rewrites them, so it does need room for what its source parts hold.
+                /// The merge type alone is not proof either: it is assigned from part_max_ttl,
+                /// which aggregates every TTL family in ttl.txt — including entries the table
+                /// does not declare (a stale column TTL after ATTACH PARTITION or REMOVE TTL).
+                /// Exempt the merge from the size check only under the same condition MergeTask
+                /// uses to skip the pipeline: every source part's rows TTL is really expired.
+                /// A part that cannot be resolved here is left to the merge's fetch path and
+                /// counts as unverifiable.
                 if (entry.merge_type == MergeType::TTLDrop)
                 {
                     const auto metadata_snapshot = storage.getInMemoryMetadataPtr(storage.getContext(), false);
                     if (metadata_snapshot->hasOnlyRowsTTL())
-                        ignore_max_size = true;
+                        ignore_max_size = std::ranges::all_of(
+                            entry.source_parts,
+                            [&](const String & name)
+                            {
+                                auto part = data.getPartIfExists(name, {MergeTreeDataPartState::PreActive, MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+                                return part && part->ttl_infos.table_ttl.expired(time(nullptr));
+                            });
                 }
             }
 

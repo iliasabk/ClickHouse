@@ -1,0 +1,4 @@
+-- Case 1: column TTL carried over by ATTACH PARTITION
+200	1
+-- Case 2: column TTL orphaned by REMOVE TTL
+200	1

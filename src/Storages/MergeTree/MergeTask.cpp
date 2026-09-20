@@ -863,10 +863,23 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     ///
     /// A merge cancelled after selection has `need_remove_expired_values` cleared above and must
     /// not drop rows, so it falls through to the normal pipeline, which builds no TTLTransform.
+    ///
+    /// The merge type alone does not prove that every row is expired: it is assigned from
+    /// part_max_ttl, which aggregates every TTL family stored in ttl.txt — including entries
+    /// the table does not declare (a column TTL carried over by ATTACH PARTITION, or one left
+    /// behind by REMOVE TTL with materialize_ttl_after_modify = 0). Use the same condition
+    /// TTLTransform applies before it sets all_data_dropped: the stored rows TTL deadline of
+    /// every source part must actually be expired.
     const bool can_short_circuit_ttl_drop =
         global_ctx->future_part->merge_type == MergeType::TTLDrop
         && global_ctx->metadata_snapshot->hasOnlyRowsTTL()
-        && ctx->need_remove_expired_values;
+        && ctx->need_remove_expired_values
+        && std::ranges::all_of(
+            global_ctx->future_part->parts,
+            [time_of_merge = global_ctx->time_of_merge](const auto & part)
+            {
+                return part->ttl_infos.table_ttl.expired(time_of_merge);
+            });
 
     /// The short-circuit below commits a 0-row part without ever running a pipeline, so nothing
     /// would retire these projections. Decide before the bookkeeping rather than undoing it

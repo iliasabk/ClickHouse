@@ -307,8 +307,20 @@ void UserDefinedSQLFunctionFactory::restore(RestorerFromBackup & restorer, const
     bool throw_if_exists = (restore_settings.create_function == RestoreUDFCreationMode::kCreate);
     bool replace_if_exists = (restore_settings.create_function == RestoreUDFCreationMode::kReplace);
     auto restore_context = restorer.getContext();
+    auto log = getLogger("UserDefinedSQLFunctionFactory");
     for (const auto & [function_name, create_function_query] : restored_functions)
+    {
+        /// A user defined function whose name is now taken by a built-in function or aggregate can never be
+        /// registered again (and could not even be dropped afterwards), so skipping it must not abort the
+        /// rest of the restore.
+        if (FunctionFactory::instance().hasNameOrAlias(function_name)
+            || AggregateFunctionFactory::instance().hasNameOrAlias(function_name))
+        {
+            LOG_WARNING(log, "Skipping restore of user defined function {}: the name is now used by a built-in function", backQuote(function_name));
+            continue;
+        }
         registerFunction(restore_context, function_name, create_function_query, throw_if_exists, replace_if_exists);
+    }
 }
 
 void UserDefinedSQLFunctionFactory::loadFunctions(IUserDefinedSQLObjectsStorage & function_storage, WasmModuleManager & wasm_module_manager)

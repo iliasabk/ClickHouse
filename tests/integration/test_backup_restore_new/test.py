@@ -1695,6 +1695,44 @@ def test_system_functions():
     instance.query("DROP FUNCTION parity_str")
 
 
+def test_system_functions_restored_name_is_now_builtin():
+    # Regression test for #121340: a UDF whose name became a built-in (or an
+    # alias of one) on the restoring version can never be registered again, so
+    # the restore must skip it instead of failing the whole RESTORE.
+    instance.query("CREATE FUNCTION udf_to_collide AS x -> x + 1")
+    instance.query("CREATE FUNCTION udf_to_keep AS x -> x * 10")
+
+    backup_name = new_backup_name()
+    instance.query(f"BACKUP TABLE system.functions TO {backup_name}")
+
+    instance.query("DROP FUNCTION udf_to_collide")
+    instance.query("DROP FUNCTION udf_to_keep")
+
+    # Simulate the version upgrade that made the name a built-in: the restored
+    # object name comes from the .sql file name inside the backup, so renaming
+    # the entry produces the same situation as a backup taken before "stddev"
+    # existed as an alias of stddevSamp.
+    backup_dir = get_path_to_backup(backup_name)
+    hits = [
+        p
+        for p in glob.glob(backup_dir + "/**/*.sql", recursive=True)
+        if os.path.basename(p) == "udf_to_collide.sql"
+    ]
+    assert len(hits) == 1
+    colliding_path = os.path.join(os.path.dirname(hits[0]), "stddev.sql")
+    with open(hits[0]) as f:
+        contents = f.read()
+    with open(colliding_path, "w") as f:
+        f.write(contents.replace("udf_to_collide", "stddev"))
+    os.remove(hits[0])
+
+    instance.query(f"RESTORE TABLE system.functions FROM {backup_name}")
+
+    # The colliding UDF is skipped and the rest of the backup is restored.
+    assert instance.query("SELECT udf_to_keep(3)") == "30\n"
+    instance.query("DROP FUNCTION udf_to_keep")
+
+
 def test_backup_partition():
     create_and_fill_table(n=30)
 

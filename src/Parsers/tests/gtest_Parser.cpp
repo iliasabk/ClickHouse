@@ -294,10 +294,10 @@ TEST(ParserCreateQuery, MaskNATSTableEngineCredentials)
     EXPECT_NE(settings_masked.find("nats_credentials = '[HIDDEN]'"), String::npos);
 }
 
-TEST(ParserCreateQuery, MaskNATSTableEngineURLPassword)
+TEST(ParserCreateQuery, MaskNATSTableEngineURLCredentials)
 {
-    /// A `nats_url` override can carry the credentials in its userinfo. Only the password is hidden,
-    /// keeping the rest of the url visible, the same way the `SETTINGS` clause form is masked.
+    /// A `nats_url` override can carry the credentials in its userinfo. The whole userinfo is
+    /// hidden, keeping the host visible, the same way the `SETTINGS` clause form is masked.
     const String query =
         "CREATE TABLE test_nats (key UInt64) "
         "ENGINE = NATS(nats1, nats_url = 'nats://plain_user:plain_password@example.com:4222')";
@@ -308,7 +308,86 @@ TEST(ParserCreateQuery, MaskNATSTableEngineURLPassword)
     const String masked = ast->formatForLogging();
 
     EXPECT_EQ(masked.find("plain_password"), String::npos);
-    EXPECT_NE(masked.find("nats://plain_user:[HIDDEN]@example.com:4222"), String::npos);
+    EXPECT_NE(masked.find("nats://[HIDDEN]@example.com:4222"), String::npos);
+}
+
+TEST(ParserCreateQuery, MaskNATSTableEngineURLCredentialsEdgeCases)
+{
+    DB::ParserCreateQuery parser;
+
+    /// A password that itself contains an at-sign is masked whole: masking only up to the first
+    /// '@' would leave the `ss@` tail visible, as `maskURIPassword` did before #121257.
+    {
+        const String query =
+            "CREATE TABLE test_nats_at (key UInt64) "
+            "ENGINE = NATS(nats1, nats_url = 'nats://plain_user:plain_pa@ss@example.com:4222')";
+
+        DB::ASTPtr ast = DB::parseQuery(parser, query, 0, 0, 0);
+        const String masked = ast->formatForLogging();
+
+        EXPECT_EQ(masked.find("plain_pa"), String::npos);
+        EXPECT_NE(masked.find("nats://[HIDDEN]@example.com:4222"), String::npos);
+    }
+
+    /// A bare credential token with no ':' separator is userinfo too, and is hidden.
+    {
+        const String query =
+            "CREATE TABLE test_nats_token (key UInt64) "
+            "ENGINE = NATS(nats1, nats_url = 'nats://plain_token@example.com:4222')";
+
+        DB::ASTPtr ast = DB::parseQuery(parser, query, 0, 0, 0);
+        const String masked = ast->formatForLogging();
+
+        EXPECT_EQ(masked.find("plain_token"), String::npos);
+        EXPECT_NE(masked.find("nats://[HIDDEN]@example.com:4222"), String::npos);
+    }
+
+    /// A url with no userinfo at all is left alone: an '@' past the authority, in the query
+    /// parameters, is not a credential and must not be mistaken for one.
+    {
+        const String query =
+            "CREATE TABLE test_nats_no_cred (key UInt64) "
+            "ENGINE = NATS(nats1, nats_url = 'nats://example.com:4222')";
+
+        DB::ASTPtr ast = DB::parseQuery(parser, query, 0, 0, 0);
+        const String masked = ast->formatForLogging();
+
+        EXPECT_NE(masked.find("nats://example.com:4222"), String::npos);
+        EXPECT_EQ(masked.find("[HIDDEN]"), String::npos);
+    }
+}
+
+TEST(ParserCreateQuery, MaskXDBCTableEngineURLCredentials)
+{
+    /// A JDBC/ODBC connection string can be a URI carrying credentials in its userinfo. The whole
+    /// userinfo is hidden, keeping host and database visible; a password containing '@' must not
+    /// leave its tail behind, and a credential token with no ':' separator is hidden as well. A
+    /// connection string that is not a URI is still hidden whole (fail closed).
+    DB::ParserCreateQuery parser;
+    {
+        const String query =
+            "CREATE TABLE test_jdbc (x UInt32) "
+            "ENGINE = JDBC('jdbc://jdbc_user:jdbc_pa@ss@jdbc-host:5432/jdbc_db', 'jdbc_db', 'jdbc_table')";
+
+        DB::ASTPtr ast = DB::parseQuery(parser, query, 0, 0, 0);
+        const String masked = ast->formatForLogging();
+
+        EXPECT_EQ(masked.find("jdbc_pa"), String::npos);
+        EXPECT_EQ(masked.find("jdbc_user"), String::npos);
+        EXPECT_NE(masked.find("jdbc://[HIDDEN]@jdbc-host:5432/jdbc_db"), String::npos);
+    }
+    {
+        const String query =
+            "CREATE TABLE test_odbc (x UInt32) "
+            "ENGINE = ODBC('DSN=odbcdsn;Uid=odbc_user;Pwd=odbc_password', 'odbc_db', 'odbc_table')";
+
+        DB::ASTPtr ast = DB::parseQuery(parser, query, 0, 0, 0);
+        const String masked = ast->formatForLogging();
+
+        EXPECT_EQ(masked.find("odbc_password"), String::npos);
+        EXPECT_EQ(masked.find("odbc_user"), String::npos);
+        EXPECT_NE(masked.find("ODBC('[HIDDEN]'"), String::npos);
+    }
 }
 
 TEST(ParserCreateQuery, MaskNATSTableEngineServerListPassword)

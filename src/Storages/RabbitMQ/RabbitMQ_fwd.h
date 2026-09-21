@@ -21,7 +21,7 @@ static inline std::unordered_map<String, ValueMaskingFunc> SETTINGS_TO_HIDE =
         std::string masked_value;
         if (!value.tryGet<std::string>(masked_value))
             return {};
-        DB::maskURIPassword(&masked_value);
+        DB::maskURIUserinfo(masked_value);
         return fmt::format("'{}'", masked_value);
     }}
 };

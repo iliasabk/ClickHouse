@@ -439,11 +439,13 @@ void FunctionSecretArgumentsFinder::findXDBCSecretArguments()
         /// JDBC('DSN', database, table) / ODBC('DSN', database, table)
         /// The connection string may be a URI with credentials embedded,
         /// e.g. scheme://username:password@host:port/dbname
-        /// If so, mask only the password part; otherwise hide the whole argument.
+        /// If so, mask the whole userinfo, not only the password part (a password can itself
+        /// contain '@', which a password-only mask leaves partly visible); otherwise hide the
+        /// whole argument.
         String uri;
         if (tryGetStringFromArgument(0, &uri))
         {
-            if (maskURIPassword(&uri))
+            if (maskURIUserinfo(uri))
             {
                 chassert(result.count == 0);
                 result.start = 0;
@@ -463,7 +465,7 @@ void FunctionSecretArgumentsFinder::maskXDBCSecretNamedArgument(std::string_view
     if (arg_idx < 0)
         return;
 
-    if (!value.empty() && maskURIPassword(&value))
+    if (!value.empty() && maskURIUserinfo(value))
     {
         result.are_named = true;
         result.start = arg_idx;
@@ -910,7 +912,10 @@ void FunctionSecretArgumentsFinder::findNATSTableEngineSecretArguments()
             String url;
             if (equals_func->arguments->at(1)->tryGetString(&url, /* allow_identifier= */ false))
             {
-                if (maskURIPassword(&url))
+                /// Mask the whole userinfo, the same way the `nats_url` table setting is masked:
+                /// a password can itself contain '@', which a password-only mask leaves partly
+                /// visible.
+                if (maskURIUserinfo(url))
                     result.replaced_arguments[i] = "nats_url = " + quoteString(url);
             }
             else

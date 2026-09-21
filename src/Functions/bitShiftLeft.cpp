@@ -155,11 +155,23 @@ struct BitShiftLeftImpl
 #if USE_EMBEDDED_COMPILER
     static constexpr bool compilable = true;
 
+    /// The JIT must see the shift amount untruncated (as UInt64): a shift by
+    /// an amount >= the bit width of the shifted type evaluates to 0 in the
+    /// interpreter, while a raw `shl` would produce an LLVM poison value.
+    static constexpr bool shift_amount_as_uint64 = true;
+
     static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * left, llvm::Value * right, bool)
     {
         if (!left->getType()->isIntegerTy())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "BitShiftLeftImpl expected an integral type");
-        return b.CreateShl(left, right);
+        /// `right` is the shift amount as UInt64 (see `shift_amount_as_uint64`);
+        /// a negative signed amount was sign-extended to a huge value and also
+        /// fails the range check, yielding 0 (the interpreter throws instead).
+        auto * bit_width = llvm::ConstantInt::get(right->getType(), left->getType()->getIntegerBitWidth());
+        auto * amount_in_range = b.CreateICmpULT(right, bit_width);
+        auto * amount = b.CreateIntCast(right, left->getType(), false);
+        auto * shifted = b.CreateShl(left, amount);
+        return b.CreateSelect(amount_in_range, shifted, llvm::ConstantInt::get(left->getType(), 0));
     }
 #endif
 };

@@ -1,0 +1,8 @@
+shift amount >= bit width, jit off
+1	0	0	0	0	0	0	0
+shift amount >= bit width, jit on
+1	0	0	0	0	0	0	0
+in-range shifts, jit off
+240	4095	1	255	-2
+in-range shifts, jit on
+240	4095	1	255	-2

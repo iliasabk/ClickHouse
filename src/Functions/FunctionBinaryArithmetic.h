@@ -3718,8 +3718,20 @@ ColumnPtr executeStringInteger(const ColumnsWithTypeAndName & arguments, const A
                         && !IsDataTypeDecimal<LeftDataType> && !IsDataTypeDecimal<RightDataType> && OpSpec::compilable)
                     {
                         auto & b = static_cast<llvm::IRBuilder<> &>(builder);
+                        /// Operations like bit shifts compare the right operand against the
+                        /// bit width of the result type and must see it untruncated; they opt
+                        /// in via `shift_amount_as_uint64` and receive it as UInt64 instead.
+                        static constexpr bool right_is_shift_amount = []
+                        {
+                            if constexpr (requires { OpSpec::shift_amount_as_uint64; })
+                                return bool(OpSpec::shift_amount_as_uint64);
+                            else
+                                return false;
+                        }();
                         auto * lval = nativeCast(b, arguments[0], result_type);
-                        auto * rval = nativeCast(b, arguments[1], result_type);
+                        auto * rval = right_is_shift_amount
+                            ? nativeCast(b, arguments[1], std::make_shared<DataTypeUInt64>())
+                            : nativeCast(b, arguments[1], result_type);
                         result = OpSpec::compile(b, lval, rval, is_signed_v<typename ResultDataType::FieldType>);
                         return true;
                     }
